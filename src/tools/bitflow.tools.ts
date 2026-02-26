@@ -5,6 +5,26 @@ import { getBitflowService } from "../services/bitflow.service.js";
 import { getExplorerTxUrl } from "../config/networks.js";
 import { createJsonResponse, createErrorResponse, resolveFee } from "../utils/index.js";
 
+function baseUnitsToHumanUnits(baseUnits: string, decimals: number): number {
+  if (!/^\d+$/.test(baseUnits)) {
+    throw new Error("amountIn must be a non-negative integer when amountUnit='base'");
+  }
+
+  if (decimals === 0) return Number(baseUnits);
+
+  const padded = baseUnits.padStart(decimals + 1, "0");
+  const whole = padded.slice(0, -decimals);
+  const fraction = padded.slice(-decimals).replace(/0+$/, "");
+  const human = fraction.length > 0 ? `${whole}.${fraction}` : whole;
+
+  const numeric = Number(human);
+  if (!Number.isFinite(numeric)) {
+    throw new Error("Converted amount is too large to handle safely");
+  }
+
+  return numeric;
+}
+
 export function registerBitflowTools(server: McpServer): void {
   // ==========================================================================
   // Public API Tools (No API Key Required)
@@ -178,10 +198,17 @@ Note: Bitflow is only available on mainnet.`,
       inputSchema: {
         tokenX: z.string().describe("Input token ID (contract address)"),
         tokenY: z.string().describe("Output token ID (contract address)"),
-        amountIn: z.string().describe("Amount of input token (in smallest units)"),
+        amountIn: z
+          .string()
+          .describe("Amount of input token. Default interpretation is human units (e.g. '100' = 100 LEO)."),
+        amountUnit: z
+          .enum(["human", "base"])
+          .optional()
+          .default("human")
+          .describe("Amount units: 'human' (default, frontend-style) or 'base' (smallest units)."),
       },
     },
-    async ({ tokenX, tokenY, amountIn }) => {
+    async ({ tokenX, tokenY, amountIn, amountUnit }) => {
       try {
         if (NETWORK !== "mainnet") {
           return createJsonResponse({
@@ -199,10 +226,32 @@ Note: Bitflow is only available on mainnet.`,
           });
         }
 
-        const quote = await bitflowService.getSwapQuote(tokenX, tokenY, Number(amountIn));
+        let normalizedAmountIn = Number(amountIn);
+
+        if (!Number.isFinite(normalizedAmountIn) || normalizedAmountIn <= 0) {
+          throw new Error("amountIn must be a positive number");
+        }
+
+        if (amountUnit === "base") {
+          const tokens = await bitflowService.getAvailableTokens();
+          const tokenIn = tokens.find((t) => t.id === tokenX);
+          if (!tokenIn) {
+            throw new Error(`Unknown tokenX '${tokenX}' for base-unit conversion`);
+          }
+          normalizedAmountIn = baseUnitsToHumanUnits(amountIn, tokenIn.decimals);
+        }
+
+        const quote = await bitflowService.getSwapQuote(tokenX, tokenY, normalizedAmountIn);
 
         return createJsonResponse({
           network: NETWORK,
+          inputs: {
+            tokenX,
+            tokenY,
+            amountIn,
+            amountUnit: amountUnit || "human",
+            normalizedAmountIn,
+          },
           quote,
         });
       } catch (error) {
@@ -276,7 +325,14 @@ Note: Bitflow is only available on mainnet.`,
       inputSchema: {
         tokenX: z.string().describe("Input token ID (contract address)"),
         tokenY: z.string().describe("Output token ID (contract address)"),
-        amountIn: z.string().describe("Amount of input token (in smallest units)"),
+        amountIn: z
+          .string()
+          .describe("Amount of input token. Default interpretation is human units (e.g. '100' = 100 LEO)."),
+        amountUnit: z
+          .enum(["human", "base"])
+          .optional()
+          .default("human")
+          .describe("Amount units: 'human' (default, frontend-style) or 'base' (smallest units)."),
         slippageTolerance: z
           .number()
           .optional()
@@ -288,7 +344,7 @@ Note: Bitflow is only available on mainnet.`,
           .describe("Optional fee: 'low' | 'medium' | 'high' preset or micro-STX amount. If omitted, auto-estimated."),
       },
     },
-    async ({ tokenX, tokenY, amountIn, slippageTolerance, fee }) => {
+    async ({ tokenX, tokenY, amountIn, amountUnit, slippageTolerance, fee }) => {
       try {
         if (NETWORK !== "mainnet") {
           return createJsonResponse({
@@ -306,13 +362,28 @@ Note: Bitflow is only available on mainnet.`,
           });
         }
 
+        let normalizedAmountIn = Number(amountIn);
+
+        if (!Number.isFinite(normalizedAmountIn) || normalizedAmountIn <= 0) {
+          throw new Error("amountIn must be a positive number");
+        }
+
+        if (amountUnit === "base") {
+          const tokens = await bitflowService.getAvailableTokens();
+          const tokenIn = tokens.find((t) => t.id === tokenX);
+          if (!tokenIn) {
+            throw new Error(`Unknown tokenX '${tokenX}' for base-unit conversion`);
+          }
+          normalizedAmountIn = baseUnitsToHumanUnits(amountIn, tokenIn.decimals);
+        }
+
         const account = await getAccount();
         const resolvedFee = await resolveFee(fee, NETWORK, "contract_call");
         const result = await bitflowService.swap(
           account,
           tokenX,
           tokenY,
-          Number(amountIn),
+          normalizedAmountIn,
           slippageTolerance || 0.01,
           resolvedFee
         );
@@ -324,6 +395,8 @@ Note: Bitflow is only available on mainnet.`,
             tokenIn: tokenX,
             tokenOut: tokenY,
             amountIn,
+            amountUnit: amountUnit || "human",
+            normalizedAmountIn,
             slippageTolerance: slippageTolerance || 0.01,
           },
           network: NETWORK,
